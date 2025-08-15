@@ -1,0 +1,15 @@
+data/
+*.pth
+.env
+__pycache__/
+*.pyc
+*.zip
+.DS_Store
+Thumbs.db
+*.jpg
+*.png
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
