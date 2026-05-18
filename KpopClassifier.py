@@ -8,22 +8,19 @@ class KpopClassifier(nn.Module):
     def __init__(self, num_classes, embedding_dim=512):
         super().__init__()
 
-        # ResNet50 gives 2048-dim features vs ResNet34's 512, meaningfully better for
-        # fine-grained face discrimination.
-        self.backbone = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        self.backbone = nn.Sequential(*list(self.backbone.children())[:-1])
+        _eff = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        self.backbone = nn.Sequential(*list(_eff.children())[:-1])  # features + avgpool → (B, 1280, 1, 1)
 
         self.embedding = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(2048, 1024),
-            nn.BatchNorm1d(1024),  # BN before activation stabilises ArcFace training
+            nn.Linear(1280, 640),
+            nn.BatchNorm1d(640),
             nn.ReLU(),
             nn.Dropout(0.4),
-            nn.Linear(1024, embedding_dim),
+            nn.Linear(640, embedding_dim),
             nn.BatchNorm1d(embedding_dim),
         )
 
-        # Classifier head used when ArcFace is disabled (CrossEntropy mode)
         self.classifier = nn.Sequential(
             nn.Linear(embedding_dim, 256),
             nn.ReLU(),

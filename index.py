@@ -1,4 +1,5 @@
 import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,9 +12,18 @@ import os
 
 from KpopDataset import KpopDataset
 from KpopClassifier import KpopClassifier
+from torch.utils.data import Subset
 from pathlib import Path
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+# Set to True for fast iteration: fewer epochs and a capped test sample.
+QUICK_RUN    = True
+QUICK_EPOCHS = 2
+QUICK_TEST_N = 50
+
+LOG_EVERY     = 10   # print a progress line every N training batches
+FREEZE_EPOCHS = 3    # freeze backbone for this many epochs before fine-tuning
+
+device = torch.device("mps")
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 train_image_path = Path('./data/images/HQ_512x512')
@@ -24,7 +34,6 @@ test_csv  = './data/kid_f_test.csv'
 train_df = pd.read_csv(train_csv)
 test_df  = pd.read_csv(test_csv)
 
-# Only keep classes present in both splits so labels are valid at eval time.
 available_class = sorted(
     set(train_df['name'].unique()) & set(test_df['name'].unique())
 )
@@ -50,7 +59,6 @@ val_transform = transforms.Compose([
 ])
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
-# Pass the same class_names list to every dataset so label indices are identical.
 train_dataset_full = KpopDataset(
     data_dir=train_image_path,
     csv_file=train_csv,
@@ -62,8 +70,8 @@ val_len   = int(val_ratio * len(train_dataset_full))
 train_len = len(train_dataset_full) - val_len
 train_dataset, val_dataset = random_split(train_dataset_full, [train_len, val_len])
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True,  num_workers=0, pin_memory=False)
-val_loader   = DataLoader(val_dataset,   batch_size=64, shuffle=False, num_workers=0, pin_memory=False)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=0, pin_memory=False)
+val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
 
 print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
@@ -78,7 +86,6 @@ class ArcFaceLoss(nn.Module):
         self.embedding_dim = embedding_dim
         self.margin        = margin
         self.scale         = scale
-        # Precompute trig values so they aren't recomputed each forward pass
         self.cos_m = math.cos(margin)
         self.sin_m = math.sin(margin)
         self.weight = nn.Parameter(torch.FloatTensor(num_classes, embedding_dim))
@@ -86,18 +93,14 @@ class ArcFaceLoss(nn.Module):
 
     def forward(self, embeddings, labels):
         embeddings = F.normalize(embeddings, p=2, dim=1)
-        weight     = F.normalize(self.weight,     p=2, dim=1)
-
-        cos_theta = torch.mm(embeddings, weight.t()).clamp(-1 + 1e-7, 1 - 1e-7)
-        sin_theta = torch.sqrt(1.0 - cos_theta ** 2)
-
-        # Angular margin applied only to the ground-truth class logit
+        weight     = F.normalize(self.weight, p=2, dim=1)
+        cos_theta  = torch.mm(embeddings, weight.t()).clamp(-1 + 1e-7, 1 - 1e-7)
+        sin_theta  = torch.sqrt(1.0 - cos_theta ** 2)
         cos_theta_m = cos_theta * self.cos_m - sin_theta * self.sin_m
         one_hot = F.one_hot(labels, num_classes=self.num_classes).float()
-        logits = (one_hot * cos_theta_m + (1 - one_hot) * cos_theta) * self.scale
-
-        loss = F.cross_entropy(logits, labels)
-        return loss, logits  # return logits so caller can measure accuracy
+        logits  = (one_hot * cos_theta_m + (1 - one_hot) * cos_theta) * self.scale
+        loss    = F.cross_entropy(logits, labels)
+        return loss, logits
 
 
 use_arcface = True
@@ -107,11 +110,29 @@ if use_arcface:
 else:
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-optimizer = optim.AdamW(
-    list(model.parameters()) + (list(criterion.parameters()) if use_arcface else []),
-    lr=1e-3,
-    weight_decay=0.01,
-)
+# ── Backbone freezing ─────────────────────────────────────────────────────────
+# Freeze backbone initially so only the embedding head trains. This makes early
+# epochs 3-5× faster (no backward pass through 200+ backbone layers).
+for p in model.backbone.parameters():
+    p.requires_grad = False
+
+def make_optimizer():
+    trainable = (
+        list(model.embedding.parameters()) +
+        list(model.classifier.parameters()) +
+        (list(criterion.parameters()) if use_arcface else [])
+    )
+    return optim.AdamW(trainable, lr=1e-3, weight_decay=0.01)
+
+def make_optimizer_unfrozen():
+    return optim.AdamW([
+        {'params': model.backbone.parameters(), 'lr': 1e-4},
+        {'params': model.embedding.parameters()},
+        {'params': model.classifier.parameters()},
+        *([{'params': criterion.parameters()}] if use_arcface else []),
+    ], lr=1e-3, weight_decay=0.01)
+
+optimizer = make_optimizer()
 scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
     optimizer, T_0=5, T_mult=2, eta_min=1e-6
 )
@@ -129,25 +150,33 @@ if os.path.exists(metrics_path):
         prev_best_epoch = m.get('best_epoch', 0)
     print(f"Previous best val acc: {prev_best_acc:.2f}% at epoch {prev_best_epoch}")
 
-# Don't load old checkpoint — architecture changed (ResNet34→50, embedding_dim 128→512)
-# Uncomment after first successful run:
-# if os.path.exists(model_path):
-#     model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
-
 # ── Training Loop ─────────────────────────────────────────────────────────────
-epochs       = 20
+epochs       = QUICK_EPOCHS if QUICK_RUN else 20
 best_val_acc = prev_best_acc
 best_epoch   = prev_best_epoch
 patience     = 5
 no_improve   = 0
+backbone_frozen = True
 
 print("Training…")
 for epoch in range(epochs):
+    # Unfreeze backbone after FREEZE_EPOCHS
+    if backbone_frozen and epoch >= FREEZE_EPOCHS:
+        print(f"Epoch {epoch+1}: unfreezing backbone, lowering backbone LR to 1e-4")
+        for p in model.backbone.parameters():
+            p.requires_grad = True
+        optimizer = make_optimizer_unfrozen()
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=5, T_mult=2, eta_min=1e-6
+        )
+        backbone_frozen = False
+
     model.train()
     running_loss = 0.0
     correct = total = 0
+    epoch_start = time.time()
 
-    for images, labels in train_loader:
+    for batch_idx, (images, labels) in enumerate(train_loader):
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
 
@@ -166,6 +195,12 @@ for epoch in range(epochs):
         _, predicted = torch.max(logits, 1)
         total   += labels.size(0)
         correct += (predicted == labels).sum().item()
+
+        if (batch_idx + 1) % LOG_EVERY == 0:
+            elapsed = time.time() - epoch_start
+            running_acc = 100 * correct / total
+            print(f"  [{epoch+1}/{epochs}] batch {batch_idx+1}/{len(train_loader)}  "
+                f"loss={loss.item():.4f}  acc={running_acc:.1f}%  {elapsed:.0f}s")
 
     epoch_loss = running_loss / total
     epoch_acc  = 100 * correct / total
@@ -186,10 +221,11 @@ for epoch in range(epochs):
             val_correct += (predicted == labels).sum().item()
     val_acc = 100 * val_correct / val_total
 
-    scheduler.step()  # per-epoch step for CosineAnnealingWarmRestarts
+    scheduler.step()
 
     print(f"Epoch {epoch+1}/{epochs} — Loss: {epoch_loss:.4f} — "
-          f"Train: {epoch_acc:.2f}% — Val: {val_acc:.2f}%")
+        f"Train: {epoch_acc:.2f}% — Val: {val_acc:.2f}%  "
+        f"({time.time()-epoch_start:.0f}s total)")
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
@@ -208,7 +244,6 @@ for epoch in range(epochs):
 # ── Test Evaluation ───────────────────────────────────────────────────────────
 print("\nEvaluating on test set…")
 
-# Always evaluate with the best saved weights, not the last epoch's weights
 if os.path.exists(model_path):
     model.load_state_dict(torch.load(model_path, map_location=device))
     print(f"Loaded best model (epoch {best_epoch}, val acc {best_val_acc:.2f}%)")
@@ -217,8 +252,12 @@ test_dataset = KpopDataset(
     data_dir=test_image_path,
     csv_file=test_csv,
     transform=val_transform,
-    class_names=available_class,  # same label mapping as training
+    class_names=available_class,
 )
+if QUICK_RUN:
+    full_test_n  = len(test_dataset)
+    test_dataset = Subset(test_dataset, list(range(min(QUICK_TEST_N, full_test_n))))
+    print(f"Quick run: evaluating on {len(test_dataset)} of {full_test_n} test samples")
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
 
 model.eval()
