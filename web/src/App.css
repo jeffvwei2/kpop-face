@@ -1,0 +1,166 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: #0f0f0f;
+  color: #f0f0f0;
+  font-family: system-ui, sans-serif;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.app {
+  width: 100%;
+  max-width: 480px;
+  padding: 32px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+}
+
+h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+.dropzone {
+  width: 100%;
+  aspect-ratio: 1;
+  border: 2px dashed #333;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  overflow: hidden;
+  background: #161616;
+}
+
+.dropzone:hover,
+.dropzone.dragging {
+  border-color: #9b5cf6;
+  background: #1c1624;
+}
+
+.dropzone.has-image {
+  border-style: solid;
+  border-color: #444;
+}
+
+.drop-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  color: #666;
+  text-align: center;
+  padding: 24px;
+}
+
+.drop-icon { font-size: 2.5rem; }
+
+.drop-hint p { font-size: 0.95rem; line-height: 1.5; }
+
+.link { color: #9b5cf6; text-decoration: underline; }
+
+.preview-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.status {
+  font-size: 0.95rem;
+  color: #888;
+}
+
+.status.error { color: #f87171; }
+
+.results {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.top-result {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  background: #9b5cf6;
+  border-radius: 12px;
+  padding: 16px 20px;
+}
+
+.top-name {
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.top-conf {
+  font-size: 1rem;
+  opacity: 0.85;
+}
+
+.runners-up {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.runner-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 48px;
+  align-items: center;
+  gap: 10px;
+}
+
+.runner-name {
+  font-size: 0.88rem;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar-track {
+  height: 6px;
+  background: #222;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: #6d33c4;
+  border-radius: 99px;
+  transition: width 0.4s ease;
+}
+
+.runner-conf {
+  font-size: 0.82rem;
+  color: #777;
+  text-align: right;
+}
+
+.reset-btn {
+  margin-top: 4px;
+  align-self: center;
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 8px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: border-color 0.2s, color 0.2s;
+}
+
+.reset-btn:hover {
+  border-color: #666;
+  color: #ccc;
+}

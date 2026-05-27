@@ -16,8 +16,8 @@ from torch.utils.data import Subset
 from pathlib import Path
 
 # Set to True for fast iteration: fewer epochs and a capped test sample.
-QUICK_RUN    = True
-QUICK_EPOCHS = 2
+QUICK_RUN    = False
+QUICK_EPOCHS = 5
 QUICK_TEST_N = 50
 
 LOG_EVERY     = 10   # print a progress line every N training batches
@@ -122,7 +122,7 @@ def make_optimizer():
         list(model.classifier.parameters()) +
         (list(criterion.parameters()) if use_arcface else [])
     )
-    return optim.AdamW(trainable, lr=1e-3, weight_decay=0.01)
+    return optim.AdamW(trainable, lr=1e-4, weight_decay=0.01)
 
 def make_optimizer_unfrozen():
     return optim.AdamW([
@@ -133,8 +133,8 @@ def make_optimizer_unfrozen():
     ], lr=1e-3, weight_decay=0.01)
 
 optimizer = make_optimizer()
-scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    optimizer, T_0=5, T_mult=2, eta_min=1e-6
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
 )
 
 # ── Resume from checkpoint ────────────────────────────────────────────────────
@@ -151,10 +151,10 @@ if os.path.exists(metrics_path):
     print(f"Previous best val acc: {prev_best_acc:.2f}% at epoch {prev_best_epoch}")
 
 # ── Training Loop ─────────────────────────────────────────────────────────────
-epochs       = QUICK_EPOCHS if QUICK_RUN else 20
+epochs       = QUICK_EPOCHS if QUICK_RUN else 60
 best_val_acc = prev_best_acc
 best_epoch   = prev_best_epoch
-patience     = 5
+patience     = 15
 no_improve   = 0
 backbone_frozen = True
 
@@ -166,8 +166,8 @@ for epoch in range(epochs):
         for p in model.backbone.parameters():
             p.requires_grad = True
         optimizer = make_optimizer_unfrozen()
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=5, T_mult=2, eta_min=1e-6
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
         )
         backbone_frozen = False
 
@@ -221,7 +221,7 @@ for epoch in range(epochs):
             val_correct += (predicted == labels).sum().item()
     val_acc = 100 * val_correct / val_total
 
-    scheduler.step()
+    scheduler.step(val_acc)
 
     print(f"Epoch {epoch+1}/{epochs} — Loss: {epoch_loss:.4f} — "
         f"Train: {epoch_acc:.2f}% — Val: {val_acc:.2f}%  "
@@ -231,7 +231,10 @@ for epoch in range(epochs):
         best_val_acc = val_acc
         best_epoch   = epoch + 1
         no_improve   = 0
-        torch.save(model.state_dict(), model_path)
+        torch.save({
+            'model': model.state_dict(),
+            'criterion': criterion.state_dict() if use_arcface else None,
+        }, model_path)
         with open(metrics_path, 'w') as f:
             json.dump({'best_val_acc': best_val_acc, 'best_epoch': best_epoch}, f)
         print(f"  ✓ Saved best model (val acc {val_acc:.2f}%)")
@@ -245,7 +248,13 @@ for epoch in range(epochs):
 print("\nEvaluating on test set…")
 
 if os.path.exists(model_path):
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        model.load_state_dict(checkpoint['model'])
+        if use_arcface and checkpoint.get('criterion') is not None:
+            criterion.load_state_dict(checkpoint['criterion'])
+    else:
+        model.load_state_dict(checkpoint)  # backwards compat with old format
     print(f"Loaded best model (epoch {best_epoch}, val acc {best_val_acc:.2f}%)")
 
 test_dataset = KpopDataset(
@@ -267,7 +276,9 @@ with torch.no_grad():
         images, labels = images.to(device), labels.to(device)
         if use_arcface:
             _, embeddings = model(images, return_embeddings=True)
-            _, logits     = criterion(embeddings, labels)
+            # Raw cosines (no margin penalty) for inference
+            weight_norm = F.normalize(criterion.weight, p=2, dim=1)
+            logits = torch.mm(embeddings, weight_norm.t()) * criterion.scale
         else:
             logits = model(images)
         _, predicted = torch.max(logits, 1)
