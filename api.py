@@ -1,4 +1,5 @@
 import io
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,8 +15,10 @@ CORS(app)
 
 device = torch.device("cpu")
 
-train_df = pd.read_csv('./data/kid_f_train.csv')
-test_df  = pd.read_csv('./data/kid_f_test.csv')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+train_df = pd.read_csv(os.path.join(BASE_DIR, 'data', 'kid_f_train.csv'))
+test_df  = pd.read_csv(os.path.join(BASE_DIR, 'data', 'kid_f_test.csv'))
 available_class = sorted(set(train_df['name'].unique()) & set(test_df['name'].unique()))
 num_classes = len(available_class)
 print(f"Loaded {num_classes} classes")
@@ -32,7 +35,7 @@ class ArcFaceLoss(nn.Module):
 model     = KpopClassifier(num_classes=num_classes, embedding_dim=512).to(device)
 criterion = ArcFaceLoss(num_classes=num_classes).to(device)
 
-checkpoint = torch.load('best_model.pth', map_location=device)
+checkpoint = torch.load(os.path.join(BASE_DIR, 'best_model.pth'), map_location=device)
 model.load_state_dict(checkpoint['model'])
 if checkpoint.get('criterion'):
     criterion.load_state_dict(checkpoint['criterion'])

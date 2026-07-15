@@ -1,0 +1,84 @@
+.results {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.top-result {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  background: #9b5cf6;
+  border-radius: 12px;
+  padding: 16px 20px;
+}
+
+.top-name {
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+.top-conf {
+  font-size: 1rem;
+  opacity: 0.85;
+}
+
+.runners-up {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.runner-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 48px;
+  align-items: center;
+  gap: 10px;
+}
+
+.runner-name {
+  font-size: 0.88rem;
+  color: #ccc;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar-track {
+  height: 6px;
+  background: #222;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: #6d33c4;
+  border-radius: 99px;
+  transition: width 0.4s ease;
+}
+
+.runner-conf {
+  font-size: 0.82rem;
+  color: #777;
+  text-align: right;
+}
+
+.reset-btn {
+  margin-top: 4px;
+  align-self: center;
+  background: none;
+  border: 1px solid #333;
+  color: #888;
+  padding: 8px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.9rem;
+  transition: border-color 0.2s, color 0.2s;
+}
+
+.reset-btn:hover {
+  border-color: #666;
+  color: #ccc;
+}
