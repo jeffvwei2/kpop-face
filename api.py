@@ -1,10 +1,14 @@
 import io
 import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import pandas as pd
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import FaceDetector, FaceDetectorOptions
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
@@ -49,14 +53,46 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
+# detect the face first and crop to it (with some margin)
+face_detector = FaceDetector.create_from_options(
+    FaceDetectorOptions(
+        base_options=BaseOptions(
+            model_asset_path=os.path.join(BASE_DIR, 'models', 'blaze_face_short_range.tflite')
+        )
+    )
+)
+
+
+def crop_to_face(pil_img, pad_ratio=0.25):
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(pil_img))
+    detections = face_detector.detect(mp_image).detections
+    if not detections:
+        return None
+
+    best = max(detections, key=lambda d: d.categories[0].score)
+    bbox = best.bounding_box
+    x, y, w, h = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
+    pad_x, pad_y = w * pad_ratio, h * pad_ratio
+    W, H = pil_img.size
+    left   = max(0, x - pad_x)
+    top    = max(0, y - pad_y)
+    right  = min(W, x + w + pad_x)
+    bottom = min(H, y + h + pad_y)
+    return pil_img.crop((left, top, right, bottom))
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'image' not in request.files:
         return jsonify({'error': 'No image provided'}), 400
 
-    img    = Image.open(io.BytesIO(request.files['image'].read())).convert('RGB')
-    tensor = transform(img).unsqueeze(0).to(device)
+    img = Image.open(io.BytesIO(request.files['image'].read())).convert('RGB')
+
+    face_img = crop_to_face(img)
+    if face_img is None:
+        return jsonify({'error': 'No face detected in image'}), 400
+
+    tensor = transform(face_img).unsqueeze(0).to(device)
 
     with torch.no_grad():
         _, embeddings = model(tensor, return_embeddings=True)

@@ -1,10 +1,11 @@
 import math
 import time
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import torchvision.transforms as transforms
 import pandas as pd
 import json
@@ -65,12 +66,37 @@ train_dataset_full = KpopDataset(
     transform=train_transform,
     class_names=available_class,
 )
-val_ratio = 0.2
-val_len   = int(val_ratio * len(train_dataset_full))
-train_len = len(train_dataset_full) - val_len
-train_dataset, val_dataset = random_split(train_dataset_full, [train_len, val_len])
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=0, pin_memory=False)
+# Per-class counts are wildly imbalanced (6 to 1282 images across these 23 classes),
+# so a global random_split can leave rare classes with zero validation examples and
+# makes val accuracy noisy enough to trigger early stopping on noise. Split per class
+# instead, guaranteeing every class with >1 example contributes to both splits.
+def stratified_split(df, val_ratio, seed=42):
+    rng = np.random.default_rng(seed)
+    train_idx, val_idx = [], []
+    for _, group in df.groupby('name'):
+        idx = group.index.to_numpy().copy()
+        rng.shuffle(idx)
+        n = len(idx)
+        n_val = int(round(n * val_ratio))
+        n_val = min(max(n_val, 1), n - 1) if n > 1 else 0
+        val_idx.extend(idx[:n_val])
+        train_idx.extend(idx[n_val:])
+    return train_idx, val_idx
+
+val_ratio = 0.2
+train_idx, val_idx = stratified_split(train_dataset_full.df, val_ratio)
+train_dataset = Subset(train_dataset_full, train_idx)
+val_dataset   = Subset(train_dataset_full, val_idx)
+
+# Counter the same class imbalance during training itself: without this, gradient
+# signal is dominated by the handful of classes with 1000+ images.
+train_names    = train_dataset_full.df.loc[train_idx, 'name']
+class_counts   = train_names.value_counts()
+sample_weights = train_names.map(lambda n: 1.0 / class_counts[n]).to_numpy()
+train_sampler  = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
+train_loader = DataLoader(train_dataset, batch_size=32, sampler=train_sampler, num_workers=0, pin_memory=False)
 val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_workers=0, pin_memory=False)
 
 print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
@@ -125,12 +151,15 @@ def make_optimizer():
     return optim.AdamW(trainable, lr=1e-4, weight_decay=0.01)
 
 def make_optimizer_unfrozen():
+    # Keep the head at the same LR it was already training at (1e-4) — letting it
+    # jump back up to the outer default (1e-3) here would spike the head's LR 10x
+    # at the exact moment the backbone starts getting gradients for the first time.
     return optim.AdamW([
         {'params': model.backbone.parameters(), 'lr': 1e-4},
-        {'params': model.embedding.parameters()},
-        {'params': model.classifier.parameters()},
-        *([{'params': criterion.parameters()}] if use_arcface else []),
-    ], lr=1e-3, weight_decay=0.01)
+        {'params': model.embedding.parameters(), 'lr': 1e-4},
+        {'params': model.classifier.parameters(), 'lr': 1e-4},
+        *([{'params': criterion.parameters(), 'lr': 1e-4}] if use_arcface else []),
+    ], weight_decay=0.01)
 
 optimizer = make_optimizer()
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -208,6 +237,8 @@ for epoch in range(epochs):
     # Validation
     model.eval()
     val_correct = val_total = 0
+    class_correct = torch.zeros(num_classes)
+    class_total   = torch.zeros(num_classes)
     with torch.no_grad():
         for images, labels in val_loader:
             images, labels = images.to(device), labels.to(device)
@@ -219,12 +250,21 @@ for epoch in range(epochs):
             _, predicted = torch.max(logits, 1)
             val_total   += labels.size(0)
             val_correct += (predicted == labels).sum().item()
+            for c in labels.unique().tolist():
+                mask = labels == c
+                class_total[c]   += mask.sum().item()
+                class_correct[c] += (predicted[mask] == c).sum().item()
     val_acc = 100 * val_correct / val_total
+    # Overall accuracy is dominated by the handful of huge classes — macro accuracy
+    # (unweighted mean of each class's own accuracy) shows whether the tail classes
+    # are actually being learned, since it can plateau/regress while overall looks fine.
+    seen = class_total > 0
+    macro_val_acc = 100 * (class_correct[seen] / class_total[seen]).mean().item()
 
     scheduler.step(val_acc)
 
     print(f"Epoch {epoch+1}/{epochs} — Loss: {epoch_loss:.4f} — "
-        f"Train: {epoch_acc:.2f}% — Val: {val_acc:.2f}%  "
+        f"Train: {epoch_acc:.2f}% — Val: {val_acc:.2f}% — Macro Val: {macro_val_acc:.2f}%  "
         f"({time.time()-epoch_start:.0f}s total)")
 
     if val_acc > best_val_acc:
