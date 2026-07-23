@@ -27,10 +27,19 @@ FREEZE_EPOCHS = 3    # freeze backbone for this many epochs before fine-tuning
 device = torch.device("mps")
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-train_image_path = Path('./data/images/HQ_512x512')
-test_image_path  = Path('./data/test_final_with_degrad/test')
-train_csv = './data/kid_f_train.csv'
-test_csv  = './data/kid_f_test.csv'
+# original files
+# train_image_path = Path('./data/images/HQ_512x512')
+# test_image_path  = Path('./data/test_final_with_degrad/test')
+# train_csv = './data/kid_f_train.csv'
+# test_csv  = './data/kid_f_test.csv'
+
+# combined: old kid_f_* dataset (57 people) + new Kpop_Faces dataset (95 people),
+# 23 overlapping (e.g. all 4 aespa/blackpink members) merged into one class each.
+# file_name in these CSVs is relative to data_dir, which is now the shared 'data' dir.
+train_image_path = Path('./data')
+test_image_path  = Path('./data')
+train_csv = './data/combined_train.csv'
+test_csv  = './data/combined_test.csv'
 
 train_df = pd.read_csv(train_csv)
 test_df  = pd.read_csv(test_csv)
@@ -136,6 +145,35 @@ if use_arcface:
 else:
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
+# ── Resume from checkpoint ────────────────────────────────────────────────────
+model_path   = 'best_model.pth'
+metrics_path = 'metrics.json'
+
+prev_best_acc   = 0.0
+prev_best_epoch = 0
+if os.path.exists(metrics_path):
+    with open(metrics_path) as f:
+        m = json.load(f)
+        prev_best_acc   = m.get('best_val_acc', 0.0)
+        prev_best_epoch = m.get('best_epoch', 0)
+    print(f"Previous best val acc: {prev_best_acc:.2f}% at epoch {prev_best_epoch}")
+
+# Warm-start from the existing checkpoint so a re-run continues improving the
+# same model instead of training a fresh random head from zero every time
+# (which could never catch up to prev_best_acc within the early-stop patience).
+# Skipped if the class list changed size — e.g. after switching datasets — since
+# the head/ArcFace weight shapes won't match.
+if os.path.exists(model_path):
+    checkpoint = torch.load(model_path, map_location=device)
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    try:
+        model.load_state_dict(state_dict)
+        if use_arcface and isinstance(checkpoint, dict) and checkpoint.get('criterion') is not None:
+            criterion.load_state_dict(checkpoint['criterion'])
+        print(f"Resumed weights from {model_path}")
+    except RuntimeError as e:
+        print(f"Could not resume from {model_path} (likely class count changed) — training from scratch.\n{e}")
+
 # ── Backbone freezing ─────────────────────────────────────────────────────────
 # Freeze backbone initially so only the embedding head trains. This makes early
 # epochs 3-5× faster (no backward pass through 200+ backbone layers).
@@ -165,19 +203,6 @@ optimizer = make_optimizer()
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6
 )
-
-# ── Resume from checkpoint ────────────────────────────────────────────────────
-model_path   = 'best_model.pth'
-metrics_path = 'metrics.json'
-
-prev_best_acc   = 0.0
-prev_best_epoch = 0
-if os.path.exists(metrics_path):
-    with open(metrics_path) as f:
-        m = json.load(f)
-        prev_best_acc   = m.get('best_val_acc', 0.0)
-        prev_best_epoch = m.get('best_epoch', 0)
-    print(f"Previous best val acc: {prev_best_acc:.2f}% at epoch {prev_best_epoch}")
 
 # ── Training Loop ─────────────────────────────────────────────────────────────
 epochs       = QUICK_EPOCHS if QUICK_RUN else 60

@@ -21,8 +21,8 @@ device = torch.device("cpu")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-train_df = pd.read_csv(os.path.join(BASE_DIR, 'data', 'kid_f_train.csv'))
-test_df  = pd.read_csv(os.path.join(BASE_DIR, 'data', 'kid_f_test.csv'))
+train_df = pd.read_csv(os.path.join(BASE_DIR, 'data', 'combined_train.csv'))
+test_df  = pd.read_csv(os.path.join(BASE_DIR, 'data', 'combined_test.csv'))
 available_class = sorted(set(train_df['name'].unique()) & set(test_df['name'].unique()))
 num_classes = len(available_class)
 print(f"Loaded {num_classes} classes")
