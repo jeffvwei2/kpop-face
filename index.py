@@ -76,7 +76,7 @@ train_dataset_full = KpopDataset(
     class_names=available_class,
 )
 
-# Per-class counts are wildly imbalanced (6 to 1282 images across these 23 classes),
+# Per-class counts are wildly imbalanced (1 to ~1300 images per class, median ~13),
 # so a global random_split can leave rare classes with zero validation examples and
 # makes val accuracy noisy enough to trigger early stopping on noise. Split per class
 # instead, guaranteeing every class with >1 example contributes to both splits.
@@ -111,7 +111,20 @@ val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False, num_worke
 print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = KpopClassifier(num_classes=num_classes, embedding_dim=512).to(device)
+use_arcface = True
+
+# With ArcFace the MLP head is never used (classification is by cosine against the
+# ArcFace weights), so it's left out. That also makes the model's weights independent
+# of num_classes: after classes are added, backbone + embedding still resume and only
+# the ArcFace weights start fresh.
+model = KpopClassifier(num_classes=num_classes, embedding_dim=512,
+                       use_classifier_head=not use_arcface).to(device)
+
+
+def model_state(checkpoint):
+    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
+    # Older checkpoints were saved with a head that ArcFace models no longer have.
+    return KpopClassifier.state_dict_without_head(state_dict) if model.classifier is None else state_dict
 
 # ── ArcFace Loss ──────────────────────────────────────────────────────────────
 class ArcFaceLoss(nn.Module):
@@ -138,8 +151,6 @@ class ArcFaceLoss(nn.Module):
         return loss, logits
 
 
-use_arcface = True
-
 if use_arcface:
     criterion = ArcFaceLoss(num_classes=num_classes, embedding_dim=512).to(device)
 else:
@@ -149,13 +160,20 @@ else:
 model_path   = 'best_model.pth'
 metrics_path = 'metrics.json'
 
+# Identifies the validation set a score was measured on. A score from a different
+# class list or a different number of images (e.g. after adding curated data) isn't
+# comparable, and keeping it as the bar to beat can block saving indefinitely.
+dataset_fingerprint = {'classes': available_class, 'num_images': len(train_dataset_full.df)}
+
 prev_best_acc   = 0.0
 prev_best_epoch = 0
+prev_fingerprint = None
 if os.path.exists(metrics_path):
     with open(metrics_path) as f:
         m = json.load(f)
-        prev_best_acc   = m.get('best_val_acc', 0.0)
-        prev_best_epoch = m.get('best_epoch', 0)
+        prev_best_acc    = m.get('best_val_acc', 0.0)
+        prev_best_epoch  = m.get('best_epoch', 0)
+        prev_fingerprint = m.get('dataset')
     print(f"Previous best val acc: {prev_best_acc:.2f}% at epoch {prev_best_epoch}")
 
 # Warm-start from the existing checkpoint so a re-run continues improving the
@@ -165,14 +183,31 @@ if os.path.exists(metrics_path):
 # the head/ArcFace weight shapes won't match.
 if os.path.exists(model_path):
     checkpoint = torch.load(model_path, map_location=device)
-    state_dict = checkpoint['model'] if isinstance(checkpoint, dict) and 'model' in checkpoint else checkpoint
     try:
-        model.load_state_dict(state_dict)
-        if use_arcface and isinstance(checkpoint, dict) and checkpoint.get('criterion') is not None:
-            criterion.load_state_dict(checkpoint['criterion'])
-        print(f"Resumed weights from {model_path}")
+        model.load_state_dict(model_state(checkpoint))
+        print(f"Resumed model weights from {model_path}")
     except RuntimeError as e:
-        print(f"Could not resume from {model_path} (likely class count changed) — training from scratch.\n{e}")
+        print(f"Could not resume from {model_path} — training from scratch.\n{e}")
+        prev_fingerprint = 'not resumed'  # a fresh model shouldn't have to beat the old score
+    else:
+        if use_arcface and isinstance(checkpoint, dict) and checkpoint.get('criterion') is not None:
+            try:
+                criterion.load_state_dict(checkpoint['criterion'])
+                print("Resumed ArcFace class weights")
+            except RuntimeError:
+                # Class count changed: keep the learned backbone/embedding, start the
+                # per-class weights fresh. The dataset fingerprint check below resets
+                # the bar to beat.
+                print("Class count changed — ArcFace class weights start fresh "
+                      "(backbone and embedding resumed)")
+
+# metrics.json written before fingerprints existed has none; trust it only if the
+# checkpoint actually resumed (class count matched).
+if prev_fingerprint is not None and prev_fingerprint != dataset_fingerprint:
+    print(f"Dataset changed since the previous best ({prev_best_acc:.2f}%) was recorded — "
+          f"resetting the bar to beat, so this run's best will be saved.")
+    prev_best_acc   = 0.0
+    prev_best_epoch = 0
 
 # ── Backbone freezing ─────────────────────────────────────────────────────────
 # Freeze backbone initially so only the embedding head trains. This makes early
@@ -183,7 +218,7 @@ for p in model.backbone.parameters():
 def make_optimizer():
     trainable = (
         list(model.embedding.parameters()) +
-        list(model.classifier.parameters()) +
+        (list(model.classifier.parameters()) if model.classifier is not None else []) +
         (list(criterion.parameters()) if use_arcface else [])
     )
     return optim.AdamW(trainable, lr=1e-4, weight_decay=0.01)
@@ -195,7 +230,7 @@ def make_optimizer_unfrozen():
     return optim.AdamW([
         {'params': model.backbone.parameters(), 'lr': 1e-4},
         {'params': model.embedding.parameters(), 'lr': 1e-4},
-        {'params': model.classifier.parameters(), 'lr': 1e-4},
+        *([{'params': model.classifier.parameters(), 'lr': 1e-4}] if model.classifier is not None else []),
         *([{'params': criterion.parameters(), 'lr': 1e-4}] if use_arcface else []),
     ], weight_decay=0.01)
 
@@ -301,7 +336,8 @@ for epoch in range(epochs):
             'criterion': criterion.state_dict() if use_arcface else None,
         }, model_path)
         with open(metrics_path, 'w') as f:
-            json.dump({'best_val_acc': best_val_acc, 'best_epoch': best_epoch}, f)
+            json.dump({'best_val_acc': best_val_acc, 'best_epoch': best_epoch,
+                       'dataset': dataset_fingerprint}, f)
         print(f"  ✓ Saved best model (val acc {val_acc:.2f}%)")
     else:
         no_improve += 1
@@ -314,12 +350,9 @@ print("\nEvaluating on test set…")
 
 if os.path.exists(model_path):
     checkpoint = torch.load(model_path, map_location=device)
-    if isinstance(checkpoint, dict) and 'model' in checkpoint:
-        model.load_state_dict(checkpoint['model'])
-        if use_arcface and checkpoint.get('criterion') is not None:
-            criterion.load_state_dict(checkpoint['criterion'])
-    else:
-        model.load_state_dict(checkpoint)  # backwards compat with old format
+    model.load_state_dict(model_state(checkpoint))  # handles old head-ful / bare state_dict formats
+    if use_arcface and isinstance(checkpoint, dict) and checkpoint.get('criterion') is not None:
+        criterion.load_state_dict(checkpoint['criterion'])
     print(f"Loaded best model (epoch {best_epoch}, val acc {best_val_acc:.2f}%)")
 
 test_dataset = KpopDataset(

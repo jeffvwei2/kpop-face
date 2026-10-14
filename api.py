@@ -36,11 +36,11 @@ class ArcFaceLoss(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
 
-model     = KpopClassifier(num_classes=num_classes, embedding_dim=512).to(device)
+model     = KpopClassifier(num_classes=num_classes, embedding_dim=512, use_classifier_head=False).to(device)
 criterion = ArcFaceLoss(num_classes=num_classes).to(device)
 
 checkpoint = torch.load(os.path.join(BASE_DIR, 'best_model.pth'), map_location=device)
-model.load_state_dict(checkpoint['model'])
+model.load_state_dict(KpopClassifier.state_dict_without_head(checkpoint['model']))
 if checkpoint.get('criterion'):
     criterion.load_state_dict(checkpoint['criterion'])
 
