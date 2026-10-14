@@ -18,5 +18,5 @@ description: Commit the current changes with a short, summary-level message. Use
    - Good: `feat: add wiki_search.py for free image search`
    - Good: `docs: add training and web setup to readme`
    - Too long: `fix: make classifier head optional so checkpoints resume after class count changes, and filter old keys in api.py`
-4. If the session requires an attribution trailer (e.g. `Co-Authored-By:`), add it after a blank line. It doesn't count as a body.
+4. Don't add a `Co-Authored-By:` or other attribution trailer.
 5. Commit, then reply with the commit hash and message. Don't push unless asked.
