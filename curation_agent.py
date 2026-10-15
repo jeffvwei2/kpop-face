@@ -1,7 +1,7 @@
 """
-Scaffolding for the training-data curation agent. Nothing here runs an actual
-web search or downloads anything yet -- see the TODOs. `list_underrepresented_classes`
-is real and works today.
+Training-data curation pipeline. `curate_class` (--label) runs search ->
+download -> single-face crop -> save, using wiki_search.py for free candidates.
+The embedding check against gold anchors (step 4) is still a TODO.
 
 Goal: grow data/Kpop_Faces for classes that have too few images (127 classes,
 median 6 images/class, some with just 1 -- see list_underrepresented_classes)
@@ -39,7 +39,11 @@ provider's SDK needs to be installed (`openai` or `anthropic`). Keys can go
 in .env (already gitignored).
 """
 
+import csv
+import hashlib
+import io
 import os
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -58,6 +62,15 @@ KPOP_FACES_DIR = BASE_DIR / "data" / "Kpop_Faces"
 GOLD_ANCHORS_DIR = BASE_DIR / "data" / "gold_anchors"
 CURATED_CSV = BASE_DIR / "data" / "curated_train.csv"  # new images land here first,
 # kept separate from combined_train.csv until spot-checked and merged manually.
+CURATION_LOG = BASE_DIR / "data" / "curation_log.csv"  # every processed URL and its outcome,
+# so re-runs skip images already accepted or rejected instead of downloading them again.
+
+CROP_SIZE = 256          # training resizes to 256 anyway; storing larger only wastes space
+JPEG_QUALITY = 90        # ~15-25 KB per crop
+FACE_PAD_RATIO = 0.4     # matches the framing of the existing Kpop_Faces images
+MIN_FACE_PX = 80         # smaller faces upscale into blurry crops
+MIN_FACE_SCORE = 0.6     # detections below this are ignored when counting faces
+MAX_DOWNLOAD_BYTES = 15_000_000
 
 DEFAULT_MIN_IMAGES = 30
 DEFAULT_SIMILARITY_THRESHOLD = 0.5
@@ -80,16 +93,16 @@ def label_to_group_and_person(label: str) -> tuple[str | None, str]:
     label is just the person name and the group is unknown from the label
     alone.
 
-    TODO: this currently can't recover the group for non-ambiguous labels
-    (e.g. "yujin" could be Ive's Yujin or IZ*ONE's Yujin). Cross-reference
-    against data/Kpop_Faces/*/<person> directories to disambiguate, or store
-    group alongside name in the CSV going forward.
+    For those, the group is looked up from the data/Kpop_Faces/<group>/<person>
+    folders. Returns group None when there's no folder (idols only in the
+    older kid_f dataset) or more than one.
     """
     if "_" in label:
         group, person = label.split("_", 1)
         if (KPOP_FACES_DIR / group).is_dir():
             return group, person
-    return None, label
+    groups = [d.parent.name for d in KPOP_FACES_DIR.glob(f"*/{label}") if d.is_dir()]
+    return (groups[0] if len(groups) == 1 else None), label
 
 
 SEARCH_PROMPT = (
@@ -225,23 +238,43 @@ def extract_labeled_image_urls(source: dict, label: str) -> list[str]:
     raise NotImplementedError
 
 
+MAX_RATE_LIMIT_WAIT = 30  # seconds; longer waits skip the host for the rest of the run
+
+
 def download_image(url: str) -> Image.Image | None:
-    """TODO: download with a timeout, verify it's actually image content,
-    return None (not raise) on any failure so one bad URL doesn't kill a
-    curation run."""
-    raise NotImplementedError
+    """Download into memory (never to disk) and decode as RGB. Returns None
+    if the file isn't a usable image. Raises wiki_search.RateLimited if the
+    host wants a long back-off, and requests.RequestException on network
+    errors -- both transient, so the caller shouldn't mark the URL as tried."""
+    from wiki_search import polite_get  # same User-Agent and rate limiting as the search
+
+    resp = polite_get(url, {}, max_wait=MAX_RATE_LIMIT_WAIT)
+    if not resp.headers.get("Content-Type", "").startswith("image/"):
+        return None
+    if len(resp.content) > MAX_DOWNLOAD_BYTES:
+        return None
+    try:
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    except Exception:
+        return None
 
 
-def detect_single_face(image: Image.Image) -> Image.Image | None:
-    """Confirm exactly one face is present and crop to it.
+def detect_single_face(image: Image.Image) -> tuple[Image.Image | None, str]:
+    """Square face crop resized to CROP_SIZE, or (None, reason). Rejects images
+    with zero or several faces, since group and candid photos aren't safe to
+    label automatically, and faces too small to give a sharp crop."""
+    from face_crop import crop_box, detect_faces
 
-    TODO: reuse api.py's crop_to_face / the mediapipe blaze_face detector
-    (models/blaze_face_short_range.tflite) instead of reimplementing face
-    detection here. Factor that out of api.py into a shared module if it's
-    still only defined inline there. Return None if zero or >1 faces found
-    (group/candid photos aren't safe to auto-label).
-    """
-    raise NotImplementedError
+    faces = [d for d in detect_faces(image) if d.categories[0].score >= MIN_FACE_SCORE]
+    if not faces:
+        return None, "no face"
+    if len(faces) > 1:
+        return None, f"{len(faces)} faces"
+    box = faces[0].bounding_box
+    if min(box.width, box.height) < MIN_FACE_PX:
+        return None, "face too small"
+    crop = crop_box(image, box, FACE_PAD_RATIO, square=True)
+    return crop.resize((CROP_SIZE, CROP_SIZE), Image.LANCZOS), "ok"
 
 
 def embed_face(image: Image.Image):
@@ -279,34 +312,128 @@ def is_verified_match(candidate_embedding, anchor_embeddings, threshold: float =
 
 
 class CurationReport:
-    """TODO: tally counts through the pipeline (found / downloaded /
-    passed face-detect / passed embedding-gate / saved) plus per-image
-    provenance (source URL) for later spot-checking. Print or return a
-    summary from curate_class."""
+    """Counts through the pipeline plus why each candidate was rejected."""
 
     def __init__(self, label: str):
         self.label = label
         self.found = 0
+        self.skipped_seen = 0
         self.downloaded = 0
         self.passed_face_detect = 0
-        self.passed_embedding_gate = 0
         self.saved = 0
-        self.rejected: list[dict] = []  # TODO: record why each rejection happened
+        self.rejected: dict[str, int] = defaultdict(int)
+
+    def summary(self) -> str:
+        reasons = ", ".join(f"{r}: {n}" for r, n in sorted(self.rejected.items(), key=lambda x: -x[1]))
+        return (f"{self.label}: {self.found} candidates, {self.skipped_seen} already processed, "
+                f"{self.downloaded} downloaded, {self.passed_face_detect} single-face, "
+                f"{self.saved} saved" + (f"\n  rejected - {reasons}" if reasons else ""))
 
 
-def curate_class(label: str, target_new_images: int = 20) -> CurationReport:
-    """Orchestrates the full pipeline for one class: search -> label-filter
-    -> download -> face-detect -> embedding-verify -> save.
+def _append_csv(path: Path, row: dict):
+    is_new = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row))
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
 
-    TODO: wire the functions above together. Stop once target_new_images are
-    accepted or candidates run out. Append accepted rows to CURATED_CSV
-    (file_name, name, source_url) -- do not write directly into
-    combined_train.csv. Save image files under
-    data/Kpop_Faces/<group>/<person>/ following the existing layout.
+
+def _seen_urls() -> set[str]:
+    if not CURATION_LOG.exists():
+        return set()
+    with open(CURATION_LOG, newline="") as f:
+        return {row["image_url"] for row in csv.DictReader(f)}
+
+
+def _curated_count(label: str) -> int:
+    if not CURATED_CSV.exists():
+        return 0
+    with open(CURATED_CSV, newline="") as f:
+        return sum(row["name"] == label for row in csv.DictReader(f))
+
+
+def curate_class(label: str, target_new_images: int = 20, group: str | None = None) -> CurationReport:
+    """Search -> download -> single-face crop -> save, for one class, until it
+    has target_new_images curated images in total (earlier runs count).
+
+    Candidates come from wiki_search.py (free; labeled by the wiki's own
+    structure). Images are downloaded into memory and only the 256x256 face
+    crop is written, under data/Kpop_Faces/<group>/<person>/curated_*.jpg.
+    Accepted rows go to CURATED_CSV, not combined_train.csv, so nothing
+    reaches training until reviewed and merged.
+
+    Not done yet: the embedding check against data/gold_anchors (embed_face /
+    is_verified_match). Rows are saved with verified=False so they can be
+    filtered once that exists.
     """
-    group, person = label_to_group_and_person(label)
+    import requests
+    import wiki_search
+
+    found_group, person = label_to_group_and_person(label)
+    group = group or found_group
+    if not group:
+        raise SystemExit(f"Can't tell which group {label!r} is in; pass --group.")
+    out_dir = KPOP_FACES_DIR / group / person
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     report = CurationReport(label)
-    raise NotImplementedError(f"curate_class scaffolding only -- label={label!r} group={group!r}")
+    candidates = wiki_search.search(label, person, group, list(wiki_search.SOURCES))
+    report.found = len(candidates)
+    # Galleries list shoots in order, so taking the first N would mean N shots
+    # from one photoshoot. Shuffle (fixed seed, so re-runs see the same order).
+    random.Random(label).shuffle(candidates)
+
+    seen = _seen_urls()
+    already = _curated_count(label)
+    if already >= target_new_images:
+        print(f"{label}: already has {already} curated images (target {target_new_images}); nothing to do")
+        return report
+    blocked_hosts = set()
+    for c in candidates:
+        if already + report.saved >= target_new_images:
+            break
+        url = c["image_url"]
+        if url in seen:
+            report.skipped_seen += 1
+            continue
+        host = requests.utils.urlparse(url).netloc
+        if host in blocked_hosts:
+            report.rejected["host rate-limited (retry later)"] += 1
+            continue
+
+        try:
+            image = download_image(url)
+        except wiki_search.RateLimited as e:
+            print(f"  {e}; skipping its images for the rest of this run")
+            blocked_hosts.add(host)
+            report.rejected["host rate-limited (retry later)"] += 1
+            continue  # not logged, so a later run retries it
+        except requests.RequestException:
+            report.rejected["network error (retry later)"] += 1
+            continue
+        if image is None:
+            status, file_name = "not an image", ""
+        else:
+            report.downloaded += 1
+            crop, status = detect_single_face(image)
+            file_name = ""
+            if crop is not None:
+                report.passed_face_detect += 1
+                path = out_dir / f"curated_{hashlib.sha1(url.encode()).hexdigest()[:12]}.jpg"
+                crop.save(path, "JPEG", quality=JPEG_QUALITY)
+                file_name = str(path.relative_to(BASE_DIR / "data"))  # same form as combined_train.csv
+                _append_csv(CURATED_CSV, {
+                    "file_name": file_name, "name": label, "source_url": url,
+                    "source_page": c["source_page"], "verified": False,
+                })
+                report.saved += 1
+        if status != "ok":
+            report.rejected[status] += 1
+        _append_csv(CURATION_LOG, {"label": label, "image_url": url, "status": status, "file_name": file_name})
+
+    print(report.summary())
+    return report
 
 
 if __name__ == "__main__":
@@ -320,7 +447,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--min-images", type=int, default=DEFAULT_MIN_IMAGES)
     parser.add_argument("--label", help="Curate a single class, e.g. --label yujin")
-    parser.add_argument("--target", type=int, default=20, help="New images to accept before stopping")
+    parser.add_argument("--target", type=int, default=20, help="Total curated images to reach for the class (earlier runs count)")
+    parser.add_argument("--group", help="Group, if it can't be found from data/Kpop_Faces folders")
     parser.add_argument("--provider", choices=sorted(PROVIDERS), help="Search backend (default: CURATION_PROVIDER or whichever API key is set)")
     parser.add_argument("--model", help="Override the provider's default model (or set CURATION_MODEL)")
     parser.add_argument("--search-only", action="store_true", help="With --label, just print candidate source pages and exit")
@@ -338,4 +466,4 @@ if __name__ == "__main__":
         for r in search_candidate_sources(person, group, provider=provider):
             print(f"  {r['title']}\n    {r['url']}")
     else:
-        curate_class(args.label, target_new_images=args.target)
+        curate_class(args.label, target_new_images=args.target, group=args.group)

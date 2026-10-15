@@ -40,25 +40,45 @@ CANDIDATES_DIR = BASE_DIR / "data" / "candidates"
 
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
 FANDOM_API = "https://kpop.fandom.com/api.php"
-# Wikimedia asks API clients for a descriptive User-Agent.
-USER_AGENT = "kpop-classifier-curation/0.1 (personal research; python-requests)"
+# Wikimedia asks clients for a descriptive User-Agent with contact info, and
+# rate-limits generic ones more aggressively.
+USER_AGENT = "kpop-classifier-curation/0.1 (https://github.com/jeffvwei2/kpop-face; personal research) python-requests"
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
 MIN_SIDE = 256          # smaller images rarely give a usable face crop
 THUMB_WIDTH = 1024      # download a resized thumbnail, not the multi-MB original
 COMMONS_MAX_DEPTH = 3   # person -> "by year" -> "in 2023" is depth 2
+COMMONS_MAX_CATEGORIES = 40  # popular idols have hundreds of event subcategories;
+                             # each costs ~2 rate-limited requests, and 40 is plenty
 
 MIN_INTERVAL = 1.0      # seconds between requests; Commons rate-limits bursts
 MAX_RETRIES = 5
+
+# Folder names in data/Kpop_Faces that differ from what the wikis call the group
+# (renames, stylized spellings). Matching also accepts the folder name itself.
+GROUP_ALIASES = {
+    "gidle": ["i-dle", "(G)I-DLE"],
+    "kepler": ["Kep1er"],
+    "snsd": ["Girls' Generation"],
+}
 
 session = requests.Session()
 session.headers["User-Agent"] = USER_AGENT
 _last_request = 0.0
 
 
-def polite_get(url: str, params: dict) -> requests.Response:
+class RateLimited(Exception):
+    """The server asked us to back off for longer than the caller will wait."""
+
+    def __init__(self, host: str, retry_after: int):
+        super().__init__(f"{host} rate-limited us for {retry_after}s")
+        self.host, self.retry_after = host, retry_after
+
+
+def polite_get(url: str, params: dict, max_wait: int | None = None) -> requests.Response:
     """GET with a fixed delay between requests and backoff on 429/503,
-    honoring Retry-After when the server sends one."""
+    honoring Retry-After when the server sends one. If max_wait is set and the
+    server asks for a longer wait, raise RateLimited instead of sleeping."""
     global _last_request
     for attempt in range(MAX_RETRIES):
         time.sleep(max(0.0, _last_request + MIN_INTERVAL - time.monotonic()))
@@ -68,7 +88,10 @@ def polite_get(url: str, params: dict) -> requests.Response:
             resp.raise_for_status()
             return resp
         retry_after = resp.headers.get("Retry-After", "")
-        time.sleep(int(retry_after) if retry_after.isdigit() else 5 * 2 ** attempt)
+        wait = int(retry_after) if retry_after.isdigit() else 5 * 2 ** attempt
+        if max_wait is not None and wait > max_wait:
+            raise RateLimited(requests.utils.urlparse(url).netloc, wait)
+        time.sleep(wait)
     resp.raise_for_status()
     return resp
 
@@ -78,9 +101,32 @@ def norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def api_query(api: str, **params) -> list[dict]:
-    """Run a MediaWiki action=query, following continuation, and return all
-    `query.pages` entries (or list results when no generator is used)."""
+def group_names(group: str) -> list[str]:
+    """Display names to search with, preferred first."""
+    return GROUP_ALIASES.get(group, []) + [group]
+
+
+def search_titles(api: str, person: str, group: str | None, namespace: int) -> list[str]:
+    """Search titles for the person, first alongside each group name, then
+    alone. Search requires every word to match, so "Miyeon gidle" finds
+    nothing once the group is spelled "i-dle"; the person-only query catches
+    that, and the category check afterwards does the disambiguation."""
+    queries = [f"{person} {g}" for g in group_names(group)] if group else []
+    titles = []
+    for q in queries + [person]:
+        # Top hits only: continuing would page through every match, which for a
+        # common name like "Sana" is thousands of results at one request per second.
+        for hit in api_query(api, follow_continue=False, list="search", srsearch=q,
+                             srnamespace=namespace, srlimit=10):
+            if hit["title"] not in titles:
+                titles.append(hit["title"])
+    return titles
+
+
+def api_query(api: str, follow_continue: bool = True, **params) -> list[dict]:
+    """Run a MediaWiki action=query, following continuation unless
+    follow_continue is False, and return all `query.pages` entries (or list
+    results when no generator is used)."""
     params = {"action": "query", "format": "json", "formatversion": "2", **params}
     out = []
     while True:
@@ -88,7 +134,7 @@ def api_query(api: str, **params) -> list[dict]:
         query = data.get("query", {})
         for key in ("pages", "search", "categorymembers"):
             out.extend(query.get(key, []))
-        if "continue" not in data:
+        if "continue" not in data or not follow_continue:
             return out
         params.update(data["continue"])
 
@@ -118,33 +164,38 @@ IMAGEINFO = {"prop": "imageinfo", "iiprop": "url|size|mime", "iiurlwidth": THUMB
 # --- Wikimedia Commons -------------------------------------------------------
 
 def find_commons_category(person: str, group: str | None) -> str | None:
-    query = f"{person} {group}" if group else person
-    hits = api_query(COMMONS_API, list="search", srsearch=query, srnamespace=14, srlimit=10)
-    for hit in hits:
-        title = hit["title"]
-        if group and norm(title) == norm(f"Category:{group}"):
+    names = {norm(g) for g in group_names(group)} if group else set()
+    for title in search_titles(COMMONS_API, person, group, namespace=14):
+        if norm(title.split(":", 1)[1]) in names:
             continue  # the group's own category
         if not group:
             return title
         parents = api_query(COMMONS_API, titles=title, prop="categories", cllimit="max")
         parent_names = {norm(c["title"].split(":", 1)[1]) for p in parents for c in p.get("categories", [])}
-        if norm(f"members of {group}") in parent_names:
+        # Prefix match: Commons often adds a disambiguator, e.g.
+        # "Members of Twice (musical group)".
+        if any(p.startswith(f"membersof{n}") for p in parent_names for n in names):
             return title
     return None
 
 
-def search_commons(person: str, group: str | None) -> list[dict]:
+def search_commons(person: str, group: str | None) -> list[dict] | None:
     root = find_commons_category(person, group)
     if not root:
         print(f"  commons: no person category found for {person!r} ({group})")
-        return []
+        return None
     print(f"  commons: using {root}")
     url = f"https://commons.wikimedia.org/wiki/{root.replace(' ', '_')}"
 
     entries, seen_cats, frontier = [], {root}, [root]
+    visited = 0
     for _ in range(COMMONS_MAX_DEPTH):
         next_frontier = []
         for cat in frontier:
+            if visited >= COMMONS_MAX_CATEGORIES:
+                print(f"  commons: stopped after {visited} categories")
+                return entries
+            visited += 1
             files = api_query(COMMONS_API, generator="categorymembers", gcmtitle=cat,
                               gcmtype="file", gcmlimit="max", **IMAGEINFO)
             entries.extend(image_entries(files, "commons", url))
@@ -160,26 +211,24 @@ def search_commons(person: str, group: str | None) -> list[dict]:
 # --- Kpop Fandom wiki --------------------------------------------------------
 
 def find_fandom_page(person: str, group: str | None) -> str | None:
-    query = f"{person} {group}" if group else person
-    hits = api_query(FANDOM_API, list="search", srsearch=query, srnamespace=0, srlimit=10)
-    for hit in hits:
-        title = hit["title"]
-        if "/" in title or (group and norm(title) == norm(group)):
+    names = {norm(g) for g in group_names(group)} if group else set()
+    for title in search_titles(FANDOM_API, person, group, namespace=0):
+        if "/" in title or norm(title) in names:
             continue  # subpages and the group's own page
         if not group:
             return title
         pages = api_query(FANDOM_API, titles=title, prop="categories", cllimit="max")
         cats = {norm(c["title"].split(":", 1)[1]) for p in pages for c in p.get("categories", [])}
-        if norm(group) in cats:
+        if cats & names:
             return title
     return None
 
 
-def search_fandom(person: str, group: str | None) -> list[dict]:
+def search_fandom(person: str, group: str | None) -> list[dict] | None:
     page = find_fandom_page(person, group)
     if not page:
         print(f"  fandom: no page found for {person!r} ({group})")
-        return []
+        return None
     gallery = f"{page}/Gallery"
     print(f"  fandom: using {gallery}")
     files = api_query(FANDOM_API, generator="images", titles=gallery, gimlimit="max", **IMAGEINFO)
@@ -206,6 +255,9 @@ def search(label: str, person: str, group: str | None, sources: list[str],
             print(f"  cached: {cache.relative_to(BASE_DIR)} (use --refresh to re-query)")
             return [c for c in cached["candidates"] if c["source"] in sources]
 
+    if group and norm(group) == norm(person):
+        group = None  # soloist (e.g. iu/): there's no "Members of" category to check
+
     seen, candidates, succeeded = set(), [], []
     for name in sources:
         try:
@@ -214,6 +266,8 @@ def search(label: str, person: str, group: str | None, sources: list[str],
             # Not recorded as searched, so the next run retries this source.
             print(f"  {name}: request failed ({e}); skipping")
             continue
+        if found is None:
+            continue  # person not found: not cached, so a later fix/alias gets a fresh try
         succeeded.append(name)
         for c in found:
             if c["image_url"] not in seen:

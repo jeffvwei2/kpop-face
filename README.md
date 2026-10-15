@@ -87,19 +87,33 @@ python wiki_search.py yujin --group ive --refresh   # ignore the cache and re-qu
 
 These are **candidates only**. Some will be group shots or unusable crops, so filter them before training (see below).
 
-### `curation_agent.py`: curation pipeline (work in progress)
-
-Planned pipeline per class: search → keep images credited by name → download → require exactly one face → compare against hand-picked reference images (`data/gold_anchors/<label>/`) with a pretrained face model → save to `data/curated_train.csv` for manual review before merging.
-
-Working today:
+### `curation_agent.py`: download and crop new training images
 
 ```bash
 python curation_agent.py --list-underrepresented --min-images 30   # classes that need more data
-python curation_agent.py --label yujin --search-only               # LLM web search (uses API credits)
+python curation_agent.py --label miyeon                            # curate until the class has 20 new images
+python curation_agent.py --label yujin --group ive --target 10     # --group when it can't be inferred
 ```
 
-The LLM search works with OpenAI or Anthropic. Choose with `--provider openai|anthropic`, or set `CURATION_PROVIDER`; otherwise whichever of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` is set is used (OpenAI first). Override the model with `--model` or `CURATION_MODEL`. Keys can go in `.env`.
+For one class, it gets candidates from `wiki_search.py` (cached, free), then for each candidate:
 
-Prefer `wiki_search.py`. Use LLM search only for idols the wikis don't cover, since every call is billed for searches and tokens.
+1. Downloads it **into memory only**. The full-size image is never written to disk.
+2. Keeps it only if MediaPipe finds **exactly one face** at least 80px across. Group shots, signatures and faces that are too small or far away are rejected.
+3. Saves a square face crop, resized to **256×256 JPEG (~15–25 KB)**, as `data/Kpop_Faces/<group>/<person>/curated_<hash>.jpg`. Training resizes to 256 anyway, so nothing is lost.
 
-The download, face-detection and verification steps are not implemented yet.
+It stops once the class has `--target` curated images in total (default 20; earlier runs count, so re-running is safe). Candidates are shuffled first, so the picks aren't all from one photoshoot.
+
+- **Group:** taken from the `data/Kpop_Faces/<group>/<person>/` folder. Pass `--group` when there's no folder or the name is in more than one group. Group renames and alternate spellings (gidle → i-dle, kepler → Kep1er, snsd → Girls' Generation) are mapped in `GROUP_ALIASES` in `wiki_search.py`.
+- **Output:** accepted images are listed in `data/curated_train.csv` with their source URL and page. Every URL tried, and why it was rejected, goes to `data/curation_log.csv`, so re-runs skip images already tried.
+
+**New images are not used for training automatically.** `index.py` only reads `combined_train.csv`. To use them, review the crops, delete any bad ones, and add the remaining rows (`file_name,name`) to `combined_train.csv`.
+
+**Not done yet:** checking each crop against hand-picked reference images (`data/gold_anchors/<label>/`) with a pretrained face model, to catch wrong-person images. Until then, rows are saved with `verified=False`, and manual review is the only check on identity.
+
+#### Optional: LLM search (uses API credits)
+
+```bash
+python curation_agent.py --label yujin --search-only
+```
+
+Prints candidate pages found by web search, for idols the wikis don't cover. Works with OpenAI or Anthropic. Choose with `--provider openai|anthropic` or `CURATION_PROVIDER`; otherwise whichever of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` is set is used (OpenAI first). Override the model with `--model` or `CURATION_MODEL`. Keys can go in `.env`. It isn't wired into the download step.

@@ -1,18 +1,15 @@
 import io
 import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import pandas as pd
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import FaceDetector, FaceDetectorOptions
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
 from KpopClassifier import KpopClassifier
+from face_crop import crop_to_face
 
 app = Flask(__name__)
 CORS(app)
@@ -52,34 +49,6 @@ transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
-
-# detect the face first and crop to it (with some margin)
-face_detector = FaceDetector.create_from_options(
-    FaceDetectorOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(BASE_DIR, 'models', 'blaze_face_short_range.tflite')
-        )
-    )
-)
-
-
-def crop_to_face(pil_img, pad_ratio=0.25):
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.array(pil_img))
-    detections = face_detector.detect(mp_image).detections
-    if not detections:
-        return None
-
-    best = max(detections, key=lambda d: d.categories[0].score)
-    bbox = best.bounding_box
-    x, y, w, h = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
-    pad_x, pad_y = w * pad_ratio, h * pad_ratio
-    W, H = pil_img.size
-    left   = max(0, x - pad_x)
-    top    = max(0, y - pad_y)
-    right  = min(W, x + w + pad_x)
-    bottom = min(H, y + h + pad_y)
-    return pil_img.crop((left, top, right, bottom))
-
 
 @app.route('/predict', methods=['POST'])
 def predict():
